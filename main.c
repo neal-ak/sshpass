@@ -50,6 +50,8 @@ enum program_return_codes {
     RETURN_INCORRECT_PASSWORD,
     RETURN_HOST_KEY_UNKNOWN,
     RETURN_HOST_KEY_CHANGED,
+    RETURN_INCORRECT_OTP,
+    RETURN_OTP_COMMAND_ERROR,
 };
 
 // Some systems don't define posix_openpt
@@ -61,6 +63,7 @@ posix_openpt(int flags)
 }
 #endif
 
+void run_otp_command();
 int runprogram( int argc, char *argv[] );
 void reliable_write( int fd, const void *data, size_t size );
 int handleoutput( int fd );
@@ -69,6 +72,7 @@ void sigchld_handler(int signum);
 void term_handler(int signum);
 int match( const char *reference, const char *buffer, ssize_t bufsize, int state );
 void write_pass( int fd );
+void write_otp( int fd );
 
 struct {
     enum { PWT_STDIN, PWT_FILE, PWT_FD, PWT_PASS } pwtype;
@@ -81,6 +85,10 @@ struct {
     const char *pwprompt;
     int verbose;
     char *orig_password;
+    enum { OTP_NONE, OTP_COMMAND, OTP_PASS } otptype;
+    const char *otp;
+    const char *otpcommand;
+    const char *otprompt;
 } args;
 
 static void show_help()
@@ -95,6 +103,9 @@ static void show_help()
             "   -v            Be verbose about what you're doing\n"
             "   -h            Show help (this screen)\n"
             "   -V            Print version information\n"
+            "   -o OTP        One time password\n"
+            "   -c command    executable file name printing one time password\n"
+            "   -O OTP prompt Which string should sshpass search for the one time password prompt\n"
             "At most one of -f, -d, -p or -e should be used\n");
 }
 
@@ -112,15 +123,24 @@ static int parse_options( int argc, char *argv[] )
 #define VIRGIN_PWTYPE if( args.pwtype!=PWT_STDIN ) { \
     fprintf(stderr, "Conflicting password source\n"); \
     error=RETURN_CONFLICTING_ARGUMENTS; }
+#define VIRGIN_OTPTYPE if( args.otptype!=OTP_NONE ) { \
+    fprintf(stderr, "Conflicting one time password source\n"); \
+    error=RETURN_CONFLICTING_ARGUMENTS; }
+#define HIDE_OPTARG do { \
+    int i; \
+    for( i=0; optarg[i]!='\0'; ++i ) \
+        optarg[i]='z'; \
+    } while(0)
 
-    while( (opt=getopt(argc, argv, "+f:d:p:P:heVv"))!=-1 && error==-1 ) {
+    while( (opt=getopt(argc, argv, "+f:d:p:P:o:c:O:heVv"))!=-1 && error==-1 ) {
         switch( opt ) {
         case 'f':
             // Password should come from a file
             VIRGIN_PWTYPE;
-
+            
             args.pwtype=PWT_FILE;
-            args.pwsrc.filename=optarg;
+            args.pwsrc.filename=strdup(optarg);
+            HIDE_OPTARG;
             break;
         case 'd':
             // Password should come from an open file descriptor
@@ -170,6 +190,21 @@ static int parse_options( int argc, char *argv[] )
                     "Using \"%s\" as the default password prompt indicator.\n", PACKAGE_STRING, PASSWORD_PROMPT );
             exit(0);
             break;
+        case 'o':
+            VIRGIN_OTPTYPE;
+            args.otptype=OTP_PASS;
+            args.otp=strdup(optarg);
+            HIDE_OPTARG;
+            break;
+        case 'c':
+            VIRGIN_OTPTYPE;
+            args.otptype=OTP_COMMAND;
+            args.otpcommand=strdup(optarg);
+            HIDE_OPTARG;
+            break;
+        case 'O':
+            args.otprompt=optarg;
+            break;
         }
     }
 
@@ -204,6 +239,10 @@ int main( int argc, char *argv[] )
             *args.orig_password = 'x';
             ++args.orig_password;
         }
+    }
+
+    if( args.otptype == OTP_COMMAND ) {
+        run_otp_command();
     }
 
     return runprogram( argc-opt_offset, argv+opt_offset );
@@ -409,6 +448,9 @@ int handleoutput( int fd )
     // static const char compare3[]="WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"; // Warns about man in the middle attack
     // The remote identification changed error is sent to stderr, not the tty, so we do not handle it.
     // This is not a problem, as ssh exists immediately in such a case
+    static int prevmatchO=0;
+    static int stateO=0;
+    static const char *compareO="Verification code:";
     char buffer[256];
     int ret=0;
 
@@ -416,15 +458,40 @@ int handleoutput( int fd )
         compare1 = args.pwprompt;
     }
 
+    if( args.otprompt ) {
+        compareO = args.otprompt;
+    }
+
     if( args.verbose && firsttime ) {
         firsttime=0;
         fprintf(stderr, "SSHPASS: searching for password prompt using match \"%s\"\n", compare1);
+        if( args.otptype!=OTP_NONE ) {
+            fprintf(stderr, "SSHPASS also searching for OTP prompt using match \"%s\"\n", compareO);
+        }
     }
 
     int numread=read(fd, buffer, sizeof(buffer)-1 );
     buffer[numread] = '\0';
     if( args.verbose ) {
         fprintf(stderr, "SSHPASS: read: %s\n", buffer);
+    }
+
+    if( args.otp ) {
+        stateO=match( compareO, buffer, numread, stateO );
+        if( compareO[stateO]=='\0' ) {
+            if( !prevmatchO ) {
+                if( args.verbose )
+                    fprintf(stderr, "SSHPASS detected OTP prompt. Sending OTP %s.\n", args.otp);
+                write_otp( fd );
+                stateO=0;
+                prevmatchO=1;
+            } else {
+                // Wrong OTP - terminate with proper error code
+                if( args.verbose )
+                    fprintf(stderr, "SSHPASS detected OTP prompt, again. Wrong OTP. Terminating.\n");
+                ret=RETURN_INCORRECT_OTP;
+            }
+        }
     }
 
     state1=match( compare1, buffer, numread, state1 );
@@ -574,4 +641,36 @@ void reliable_write( int fd, const void *data, size_t size )
             fprintf(stderr, "SSHPASS: Short write. Tried to write %lu, only wrote %ld\n", size, result);
         }
     }
+}
+
+void write_otp( int fd )
+{
+    reliable_write( fd, args.otp, strlen( args.otp ) );
+    reliable_write( fd, "\n", 1 );
+}
+
+void run_otp_command()
+{
+    if( args.verbose ) {
+        fprintf(stderr, "SSHPASS popen(%s)\n", args.otpcommand);
+    }
+
+    FILE *fp = popen( args.otpcommand, "r" );
+    if( fp == NULL ) {
+        if( args.verbose ) {
+            perror( args.otpcommand );
+        }
+        exit(RETURN_OTP_COMMAND_ERROR);
+    }
+
+    char buf[256];
+    if( fgets( buf, sizeof(buf), fp ) != NULL ) {
+        char *p = strchr(buf, '\n');
+        if( p != NULL ) {
+            *p='\0';
+        }
+        args.otp = strdup(buf);
+    }
+
+    pclose( fp );
 }

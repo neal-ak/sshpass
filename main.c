@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 
+#include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -52,6 +53,7 @@ enum program_return_codes {
     RETURN_HOST_KEY_CHANGED,
     RETURN_INCORRECT_OTP,
     RETURN_OTP_COMMAND_ERROR,
+    RETURN_HELP,
 };
 
 // Some systems don't define posix_openpt
@@ -63,6 +65,8 @@ posix_openpt(int flags)
 }
 #endif
 
+#define DEFAULT_ENV_PASSWORD "SSHPASS"
+
 void run_otp_command();
 int runprogram( int argc, char *argv[] );
 void reliable_write( int fd, const void *data, size_t size );
@@ -70,6 +74,7 @@ int handleoutput( int fd );
 void window_resize_handler(int signum);
 void sigchld_handler(int signum);
 void term_handler(int signum);
+void term_child(int signum);
 int match( const char *reference, const char *buffer, ssize_t bufsize, int state );
 void write_pass( int fd );
 void write_otp( int fd );
@@ -91,22 +96,37 @@ struct {
     const char *otprompt;
 } args;
 
+static void hide_password()
+{
+    assert(args.pwsrc.password==NULL);
+
+    args.pwsrc.password = strdup(args.orig_password);
+
+    // Hide the original password from prying eyes
+    while( *args.orig_password != '\0' ) {
+        *args.orig_password = '\0';
+        ++args.orig_password;
+    }
+
+    args.orig_password = NULL;
+}
+
 static void show_help()
 {
-    printf("Usage: " PACKAGE_NAME " [-f|-d|-p|-e] [-hV] command parameters\n"
-            "   -f filename   Take password to use from file\n"
-            "   -d number     Use number as file descriptor for getting password\n"
-            "   -p password   Provide password as argument (security unwise)\n"
-            "   -e            Password is passed as env-var \"SSHPASS\"\n"
-            "   With no parameters - password will be taken from stdin\n\n"
-            "   -P prompt     Which string should sshpass search for to detect a password prompt\n"
-            "   -v            Be verbose about what you're doing\n"
-            "   -h            Show help (this screen)\n"
-            "   -V            Print version information\n"
-            "   -o OTP        One time password\n"
-            "   -c command    executable file name printing one time password\n"
-            "   -O OTP prompt Which string should sshpass search for the one time password prompt\n"
-            "At most one of -f, -d, -p or -e should be used\n");
+    printf("Usage: " PACKAGE_NAME " [-f|-d|-p|-e[env_var]] [-hV] command parameters\n"
+            "   -f filename   Take password to use from file.\n"
+            "   -d number     Use number as file descriptor for getting password.\n"
+            "   -p password   Provide password as argument (security unwise).\n"
+            "   -e[env_var]   Password is passed as env-var \"env_var\" if given, \"SSHPASS\" otherwise.\n"
+            "   With no parameters - password will be taken from stdin.\n\n"
+            "   -P prompt     Which string should sshpass search for to detect a password prompt.\n"
+            "   -v            Be verbose about what you're doing.\n"
+            "   -h            Show help (this screen).\n"
+            "   -V            Print version information.\n"
+            "   -o OTP        One time password.\n"
+            "   -c command    executable file name printing one time password.\n"
+            "   -O OTP prompt Which string should sshpass search for the one time password prompt.\n"
+            "At most one of -f, -d, -p or -e should be used.\n");
 }
 
 // Parse the command line. Fill in the "args" global struct with the results. Return argv offset
@@ -132,7 +152,7 @@ static int parse_options( int argc, char *argv[] )
         optarg[i]='z'; \
     } while(0)
 
-    while( (opt=getopt(argc, argv, "+f:d:p:P:o:c:O:heVv"))!=-1 && error==-1 ) {
+    while( (opt=getopt(argc, argv, "+f:d:p:P:o:c:O:he::Vv"))!=-1 && error==-1 ) {
         switch( opt ) {
         case 'f':
             // Password should come from a file
@@ -166,24 +186,29 @@ static int parse_options( int argc, char *argv[] )
             VIRGIN_PWTYPE;
 
             args.pwtype=PWT_PASS;
-            args.orig_password=getenv("SSHPASS");
+            if( optarg==NULL )
+                optarg = "SSHPASS";
+            args.orig_password=getenv(optarg);
+
             if( args.orig_password==NULL ) {
-                fprintf(stderr, "SSHPASS: -e option given but SSHPASS environment variable not set\n");
+                fprintf(stderr, "sshpass: -e option given but \"%s\" environment variable is not set.\n", optarg);
 
                 error=RETURN_INVALID_ARGUMENTS;
             }
+            else
+                hide_password();
+            unsetenv(optarg);
             break;
         case '?':
         case ':':
             error=RETURN_INVALID_ARGUMENTS;
             break;
         case 'h':
-            error=RETURN_NOERROR;
-            break;
+            return -(RETURN_HELP+1);
         case 'V':
             printf("%s\n"
                     "(C) 2006-2011 Lingnu Open Source Consulting Ltd.\n"
-                    "(C) 2015-2016, 2021 Shachar Shemesh\n"
+                    "(C) 2015-2016, 2021-2022 Shachar Shemesh\n"
                     "This program is free software, and can be distributed under the terms of the GPL\n"
                     "See the COPYING file for more information.\n"
                     "\n"
@@ -218,9 +243,14 @@ int main( int argc, char *argv[] )
 {
     int opt_offset=parse_options( argc, argv );
 
+    if( opt_offset==-(RETURN_HELP+1) ) {
+        show_help();
+        return 0;
+    }
+
     if( opt_offset<0 ) {
         // There was some error
-        show_help();
+        fprintf(stderr, "Use \"sshpass -h\" to get help\n");
 
         return -(opt_offset+1); // -1 becomes 0, -2 becomes 1 etc.
     }
@@ -232,13 +262,7 @@ int main( int argc, char *argv[] )
     }
 
     if( args.orig_password!=NULL ) {
-        args.pwsrc.password = strdup(args.orig_password);
-
-        // Hide the original password from prying eyes
-        while( *args.orig_password != '\0' ) {
-            *args.orig_password = 'x';
-            ++args.orig_password;
-        }
+        hide_password();
     }
 
     if( args.otptype == OTP_COMMAND ) {
@@ -253,7 +277,7 @@ static int ourtty; // Our own tty
 static int masterpt;
 
 int childpid;
-int term;
+int termsig;
 
 int runprogram( int argc, char *argv[] )
 {
@@ -349,18 +373,16 @@ int runprogram( int argc, char *argv[] )
 
         // Detach us from the current TTY
         setsid();
-        // This line makes the ptty our controlling tty. We do not otherwise need it open
-        slavept=open(name, O_RDWR );
-#ifdef TIOCSCTTY
-        // On some systems, an open(2) is insufficient to set the
-        // controlling tty (see the documentation for TIOCSCTTY in
-        // tty(4)).
-        if (ioctl(slavept, TIOCSCTTY) == -1) {
+
+        // Attach the process to a controlling TTY.
+        slavept=open(name, O_RDWR | O_NOCTTY);
+        // On some systems, an open(2) is insufficient to set the controlling tty (see the documentation for
+        // TIOCSCTTY in tty(4)).
+        if (ioctl(slavept, TIOCSCTTY, 0) == -1) {
             perror("sshpass: Failed to set controlling terminal in child (TIOCSCTTY)");
             exit(RETURN_RUNTIME_ERROR);
         }
-#endif
-        close( slavept );
+        close( slavept ); // We don't need the controlling TTY actually open
 
         close( masterpt );
 
@@ -400,6 +422,16 @@ int runprogram( int argc, char *argv[] )
             FD_SET(masterpt, &readfd);
 
             int selret=pselect( masterpt+1, &readfd, NULL, NULL, NULL, &sigmask_select );
+
+            if( termsig!=0 ) {
+                // Copying termsig isn't strictly necessary, as signals are masked at this point.
+                int signum = termsig;
+                termsig = 0;
+
+                term_child(signum);
+
+                continue;
+            }
 
             if( selret>0 ) {
                 if( FD_ISSET( masterpt, &readfd ) ) {
@@ -614,6 +646,13 @@ void sigchld_handler(int signum)
 
 void term_handler(int signum)
 {
+    // BUG: There is a potential race here if two signals arrive before the main code had a chance to handle them.
+    // This seems low enough risk not to justify the extra code to correctly handle this.
+    termsig = signum;
+}
+
+void term_child(int signum)
+{
     fflush(stdout);
     switch(signum) {
     case SIGINT:
@@ -627,8 +666,6 @@ void term_handler(int signum)
             kill( childpid, signum );
         }
     }
-
-    term = 1;
 }
 
 void reliable_write( int fd, const void *data, size_t size )

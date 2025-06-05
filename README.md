@@ -53,6 +53,7 @@ Added parameters:
 ```
 -o OTP        One time password
 -c command    executable file name printing one time password
+-i number     Use number as file descriptor for getting one time password.
 -O OTP prompt Which string should sshpass search for the one time password prompt
 ```
 

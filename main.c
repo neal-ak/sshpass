@@ -90,9 +90,10 @@ struct {
     const char *pwprompt;
     int verbose;
     char *orig_password;
-    enum { OTP_NONE, OTP_COMMAND, OTP_PASS } otptype;
+    enum { OTP_NONE, OTP_COMMAND, OTP_FD, OTP_PASS } otptype;
     const char *otp;
     const char *otpcommand;
+    int otpfd;
     const char *otprompt;
 } args;
 
@@ -125,6 +126,7 @@ static void show_help()
             "   -V            Print version information.\n"
             "   -o OTP        One time password.\n"
             "   -c command    executable file name printing one time password.\n"
+            "   -i number     Use number as file descriptor for getting one time password.\n"
             "   -O OTP prompt Which string should sshpass search for the one time password prompt.\n"
             "At most one of -f, -d, -p or -e should be used.\n");
 }
@@ -139,6 +141,7 @@ static int parse_options( int argc, char *argv[] )
     // Set the default password source to stdin
     args.pwtype=PWT_STDIN;
     args.pwsrc.fd=0;
+    args.otpfd=0;
 
 #define VIRGIN_PWTYPE if( args.pwtype!=PWT_STDIN ) { \
     fprintf(stderr, "Conflicting password source\n"); \
@@ -152,7 +155,7 @@ static int parse_options( int argc, char *argv[] )
         optarg[i]='z'; \
     } while(0)
 
-    while( (opt=getopt(argc, argv, "+f:d:p:P:o:c:O:he::Vv"))!=-1 && error==-1 ) {
+    while( (opt=getopt(argc, argv, "+f:d:p:P:o:c:i:O:he::Vv"))!=-1 && error==-1 ) {
         switch( opt ) {
         case 'f':
             // Password should come from a file
@@ -226,6 +229,14 @@ static int parse_options( int argc, char *argv[] )
             args.otptype=OTP_COMMAND;
             args.otpcommand=strdup(optarg);
             HIDE_OPTARG;
+            break;
+        case 'i':
+            // One time password should come from an open file descriptor
+            VIRGIN_OTPTYPE;
+
+            args.otptype=OTP_FD;
+            args.otp="via file descriptor";
+            args.otpfd=atoi(optarg);
             break;
         case 'O':
             args.otprompt=optarg;
@@ -682,8 +693,16 @@ void reliable_write( int fd, const void *data, size_t size )
 
 void write_otp( int fd )
 {
-    reliable_write( fd, args.otp, strlen( args.otp ) );
-    reliable_write( fd, "\n", 1 );
+    switch( args.otptype ) {
+    case OTP_FD:
+        write_pass_fd( args.otpfd, fd );
+        break;
+    case OTP_PASS:
+    case OTP_COMMAND:
+        reliable_write( fd, args.otp, strlen( args.otp ) );
+        reliable_write( fd, "\n", 1 );
+        break;
+    }
 }
 
 void run_otp_command()
